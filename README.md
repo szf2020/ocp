@@ -1,6 +1,16 @@
 # openclaw-claude-proxy
 
-Use your Claude Pro/Max subscription as an OpenClaw model provider — no API key needed.
+> **Already paying for Claude Pro/Max? Use it as your OpenClaw model provider — $0 extra API cost.**
+
+A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run.
+
+**Why?**
+- **$0 API cost** — uses your Claude Pro/Max subscription, not pay-per-token API
+- **Zero dependencies** — single Node.js file, no `npm install`
+- **One command setup** — `node setup.mjs` handles everything
+- **OpenAI-compatible** — standard `/v1/chat/completions` endpoint
+- **All Claude models** — Opus 4.6, Sonnet 4.6, Haiku 4
+- **Streaming support** — real-time SSE responses
 
 ## How it works
 
