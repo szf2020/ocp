@@ -5,11 +5,16 @@
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
- * Supports both streaming (SSE) and non-streaming responses.
+ * Features:
+ *   - Process pool: pre-spawns CLI processes to eliminate cold start latency
+ *   - SSE streaming + non-streaming responses
+ *   - Concurrent request support
  *
  * Env vars:
  *   CLAUDE_PROXY_PORT  — listen port (default: 3456)
  *   CLAUDE_BIN         — path to claude binary (default: "claude")
+ *   CLAUDE_TIMEOUT     — per-request timeout in ms (default: 120000)
+ *   CLAUDE_POOL_SIZE   — warm process pool size per model (default: 1)
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -17,7 +22,9 @@ import { randomUUID } from "node:crypto";
 
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = process.env.CLAUDE_BIN || "claude";
-const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "120000", 10);
+const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
+const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "1", 10);
+const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
 
 // Model alias mapping: request model → claude CLI --model arg
 const MODEL_MAP = {
@@ -34,6 +41,93 @@ const MODELS = [
   { id: "claude-haiku-4", name: "Claude Haiku 4" },
 ];
 
+// ── Process Pool ──────────────────────────────────────────────────────────
+// Pre-spawns `claude -p` processes that read prompts from stdin.
+// When a request arrives, we grab a warm process and pipe the prompt in.
+// After the process finishes, a new one is spawned to replace it.
+
+const pool = new Map(); // model → [{ proc, ready }]
+
+function spawnWarm(cliModel) {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
+  const proc = spawn(CLAUDE, [
+    "-p", "--model", cliModel,
+    "--output-format", "text",
+    "--no-session-persistence",
+    "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+  ], { env, stdio: ["pipe", "pipe", "pipe"] });
+
+  const entry = { proc, cliModel, ready: true, spawnedAt: Date.now() };
+
+  proc.on("error", (err) => {
+    console.error(`[pool] spawn error model=${cliModel}: ${err.message}`);
+    entry.ready = false;
+  });
+
+  proc.on("exit", () => {
+    entry.ready = false;
+    // Remove from pool
+    const arr = pool.get(cliModel);
+    if (arr) {
+      const idx = arr.indexOf(entry);
+      if (idx !== -1) arr.splice(idx, 1);
+    }
+    // Replenish
+    replenishPool(cliModel);
+  });
+
+  return entry;
+}
+
+// Recycle idle processes to prevent stale connections
+function recycleStaleProcesses() {
+  const now = Date.now();
+  for (const [cliModel, arr] of pool) {
+    for (const entry of arr) {
+      if (entry.ready && (now - entry.spawnedAt) > POOL_MAX_IDLE) {
+        console.log(`[pool] recycling stale process model=${cliModel} (idle ${Math.round((now - entry.spawnedAt) / 1000)}s)`);
+        entry.ready = false;
+        entry.proc.kill();
+        // exit handler will replenish
+      }
+    }
+  }
+}
+
+setInterval(recycleStaleProcesses, 15000); // check every 15s
+
+function replenishPool(cliModel) {
+  if (!pool.has(cliModel)) pool.set(cliModel, []);
+  const arr = pool.get(cliModel);
+  const alive = arr.filter((e) => e.ready).length;
+  for (let i = alive; i < POOL_SIZE; i++) {
+    const entry = spawnWarm(cliModel);
+    arr.push(entry);
+    console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length})`);
+  }
+}
+
+function getWarmProcess(cliModel) {
+  const arr = pool.get(cliModel) || [];
+  const entry = arr.find((e) => e.ready);
+  if (entry) {
+    entry.ready = false; // mark as in-use
+    const warmMs = Date.now() - entry.spawnedAt;
+    console.log(`[pool] using warm process model=${cliModel} (warm for ${warmMs}ms)`);
+    return entry.proc;
+  }
+  return null;
+}
+
+// Initialize pool for all models
+function initPool() {
+  for (const cliModel of new Set(Object.values(MODEL_MAP))) {
+    replenishPool(cliModel);
+  }
+}
+
 // ── Call claude CLI ─────────────────────────────────────────────────────
 function callClaude(model, messages) {
   return new Promise((resolve, reject) => {
@@ -47,31 +141,52 @@ function callClaude(model, messages) {
       .join("\n\n");
 
     const cliModel = MODEL_MAP[model] || model;
-    const args = [
-      "-p", "--model", cliModel,
-      "--output-format", "text",
-      "--no-session-persistence",
-      "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-      "--", prompt,
-    ];
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
+
+    // Try to use a warm process from the pool
+    let proc = getWarmProcess(cliModel);
+    let usedPool = !!proc;
+
+    if (!proc) {
+      // Cold start fallback: spawn fresh
+      console.log(`[pool] no warm process for model=${cliModel}, cold starting...`);
+      const env = { ...process.env };
+      delete env.CLAUDECODE;
+      proc = spawn(CLAUDE, [
+        "-p", "--model", cliModel,
+        "--output-format", "text",
+        "--no-session-persistence",
+        "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+        "--", prompt,
+      ], { env, stdio: ["ignore", "pipe", "pipe"] });
+    }
 
     let stdout = "";
     let stderr = "";
-    const proc = spawn(CLAUDE, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const t0 = Date.now();
+
     proc.stdout.on("data", (d) => (stdout += d));
     proc.stderr.on("data", (d) => (stderr += d));
     proc.on("close", (code) => {
+      const elapsed = Date.now() - t0;
       if (code !== 0) {
-        console.error(`[claude] exit=${code} model=${cliModel} stderr=${stderr.slice(0, 300)}`);
+        console.error(`[claude] exit=${code} model=${cliModel} elapsed=${elapsed}ms stderr=${stderr.slice(0, 300)}`);
         reject(new Error(stderr || stdout || `exit ${code}`));
       } else {
-        console.log(`[claude] ok model=${cliModel} chars=${stdout.length}`);
+        console.log(`[claude] ok model=${cliModel} chars=${stdout.length} elapsed=${elapsed}ms pool=${usedPool}`);
         resolve(stdout.trim());
       }
     });
     proc.on("error", reject);
+
+    // Log prompt size for debugging
+    console.log(`[claude] request model=${cliModel} prompt_chars=${prompt.length} pool=${usedPool}`);
+
+    // If using pool process, send prompt via stdin
+    if (usedPool) {
+      proc.stdin.write(prompt);
+      proc.stdin.end();
+    }
+
     const timer = setTimeout(() => { proc.kill(); reject(new Error("timeout")); }, TIMEOUT);
     proc.on("close", () => clearTimeout(timer));
   });
@@ -177,8 +292,14 @@ const server = createServer(async (req, res) => {
     return handleChatCompletions(req, res);
   }
 
-  // Health check
-  if (req.url === "/health") return jsonResponse(res, 200, { status: "ok" });
+  // GET /health — includes pool status
+  if (req.url === "/health") {
+    const poolStatus = {};
+    for (const [model, arr] of pool) {
+      poolStatus[model] = { total: arr.length, ready: arr.filter(e => e.ready).length };
+    }
+    return jsonResponse(res, 200, { status: "ok", pool: poolStatus });
+  }
 
   // Catch-all: try to handle any POST with messages
   if (req.method === "POST") {
@@ -188,9 +309,13 @@ const server = createServer(async (req, res) => {
   jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health" });
 });
 
+// ── Start ──────────────────────────────────────────────────────────────
+initPool();
+
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openclaw-claude-proxy listening on http://127.0.0.1:${PORT}`);
+  console.log(`openclaw-claude-proxy v1.3.1 listening on http://127.0.0.1:${PORT}`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT}ms`);
+  console.log(`Pool size: ${POOL_SIZE} per model, max idle: ${POOL_MAX_IDLE / 1000}s`);
 });
