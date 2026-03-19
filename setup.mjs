@@ -279,3 +279,96 @@ if (!SKIP_START && !DRY_RUN) {
     execSync(`bash "${startPath}"`, { stdio: "inherit" });
   } catch { /* ignore */ }
 }
+
+// ── Step 7: Install auto-start on boot ──────────────────────────────────
+if (!DRY_RUN) {
+  console.log("\n🔄 Installing auto-start on login...\n");
+
+  const platform = process.platform;
+  const nodeBin = process.execPath;
+
+  // Ensure logs dir exists
+  const logsDir = join(OPENCLAW_DIR, "logs");
+  if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
+
+  if (platform === "darwin") {
+    // macOS: launchd
+    const plistDir = join(HOME, "Library", "LaunchAgents");
+    if (!existsSync(plistDir)) mkdirSync(plistDir, { recursive: true });
+
+    const plistPath = join(plistDir, "ai.openclaw.proxy.plist");
+    const logPath = join(logsDir, "proxy.log");
+
+    const plistXml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodeBin}</string>
+    <string>${serverPath}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>${PORT}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${logPath}</string>
+  <key>StandardErrorPath</key>
+  <string>${logPath}</string>
+</dict>
+</plist>
+`;
+
+    writeFileSync(plistPath, plistXml);
+    log(`Plist written: ${plistPath}`);
+
+    // Unload first (in case it was already loaded) then load
+    try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
+    execSync(`launchctl load "${plistPath}"`);
+    log(`launchctl loaded ai.openclaw.proxy`);
+
+  } else if (platform === "linux") {
+    // Linux: systemd user service
+    const systemdDir = join(HOME, ".config", "systemd", "user");
+    if (!existsSync(systemdDir)) mkdirSync(systemdDir, { recursive: true });
+
+    const servicePath = join(systemdDir, "openclaw-proxy.service");
+    const logPath = join(logsDir, "proxy.log");
+
+    const serviceUnit = `[Unit]
+Description=OpenClaw Claude Proxy
+After=network.target
+
+[Service]
+ExecStart=${nodeBin} ${serverPath}
+Environment=CLAUDE_PROXY_PORT=${PORT}
+Restart=always
+StandardOutput=append:${logPath}
+StandardError=append:${logPath}
+
+[Install]
+WantedBy=default.target
+`;
+
+    writeFileSync(servicePath, serviceUnit);
+    log(`Service file written: ${servicePath}`);
+
+    execSync(`systemctl --user daemon-reload`);
+    execSync(`systemctl --user enable openclaw-proxy`);
+    execSync(`systemctl --user start openclaw-proxy`);
+    log(`systemd user service enabled and started`);
+
+  } else {
+    warn(`Auto-start not supported on ${platform} — start manually with: bash ${startPath}`);
+  }
+
+  console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
+}

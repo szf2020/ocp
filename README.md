@@ -26,33 +26,13 @@ The proxy translates OpenAI-compatible `/v1/chat/completions` requests into `cla
 - **Claude CLI** installed and authenticated (`claude login`)
 - **OpenClaw** installed
 
-## Quick Install
-
-### Docker (recommended)
+## Quick Start (Node.js)
 
 ```bash
 git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
 cd openclaw-claude-proxy
-cp .env.example .env   # add your CLAUDE_SESSION_TOKEN / CLAUDE_COOKIES
-docker compose up -d
-```
 
-Or as a single command if you already have a `.env` ready:
-
-```bash
-git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git && cd openclaw-claude-proxy && docker compose up -d
-```
-
-Health check: `curl http://localhost:3456/health`
-
-### Node.js (local)
-
-```bash
-# Clone
-git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
-cd openclaw-claude-proxy
-
-# Auto-configure OpenClaw + start proxy
+# Auto-configure OpenClaw + start proxy + install auto-start
 node setup.mjs
 ```
 
@@ -61,11 +41,23 @@ That's it. The setup script will:
 2. Add `claude-local` provider to `openclaw.json`
 3. Add auth profiles to all agents
 4. Start the proxy
+5. Install auto-start on login (launchd on macOS, systemd on Linux)
 
 Then set your preferred Claude model as default:
 ```bash
 openclaw config set agents.defaults.model.primary "claude-local/claude-opus-4-6"
 openclaw gateway restart
+```
+
+## Security
+
+- **Localhost only** — the proxy binds to `127.0.0.1` and is not exposed to the internet or your local network
+- **No API keys** — authentication goes through Claude CLI's OAuth session, no credentials are stored in the proxy
+- **Auto-start via launchd/systemd** — `node setup.mjs` installs a user-level launch agent (macOS) or systemd user service (Linux) so the proxy starts automatically on login
+- **Remove auto-start** at any time:
+
+```bash
+node uninstall.mjs
 ```
 
 ## Manual Install
@@ -148,12 +140,24 @@ openclaw gateway restart
 - `POST /v1/chat/completions` — Chat completion (streaming + non-streaming)
 - `GET /health` — Health check
 
-## Auto-start on Login (macOS)
+## Server / Advanced: Docker
 
-Add to your `~/.zshrc`:
+For server deployments or if you prefer Docker:
+
 ```bash
-bash ~/.openclaw/projects/claude-proxy/start.sh 2>/dev/null
+git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
+cd openclaw-claude-proxy
+cp .env.example .env   # add your CLAUDE_SESSION_TOKEN / CLAUDE_COOKIES
+docker compose up -d
 ```
+
+Or as a single command if you already have a `.env` ready:
+
+```bash
+git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git && cd openclaw-claude-proxy && docker compose up -d
+```
+
+Health check: `curl http://localhost:3456/health`
 
 ## Recovery after OpenClaw upgrade
 
