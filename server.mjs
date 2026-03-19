@@ -19,6 +19,12 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
 
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = process.env.CLAUDE_BIN || "claude";
@@ -26,7 +32,7 @@ const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
 const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "1", 10);
 const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
 
-const VERSION = "1.4.0";
+const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
 // Model alias mapping: request model → claude CLI --model arg
