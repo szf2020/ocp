@@ -28,6 +28,25 @@ The proxy translates OpenAI-compatible `/v1/chat/completions` requests into `cla
 
 ## Quick Install
 
+### Docker (recommended)
+
+```bash
+git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
+cd openclaw-claude-proxy
+cp .env.example .env   # add your CLAUDE_SESSION_TOKEN / CLAUDE_COOKIES
+docker compose up -d
+```
+
+Or as a single command if you already have a `.env` ready:
+
+```bash
+git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git && cd openclaw-claude-proxy && docker compose up -d
+```
+
+Health check: `curl http://localhost:3456/health`
+
+### Node.js (local)
+
 ```bash
 # Clone
 git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git

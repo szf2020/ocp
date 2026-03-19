@@ -26,6 +26,9 @@ const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
 const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "1", 10);
 const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
 
+const VERSION = "1.4.0";
+const START_TIME = Date.now();
+
 // Model alias mapping: request model → claude CLI --model arg
 const MODEL_MAP = {
   "claude-opus-4-6": "opus",
@@ -292,13 +295,27 @@ const server = createServer(async (req, res) => {
     return handleChatCompletions(req, res);
   }
 
-  // GET /health — includes pool status
+  // GET /health — includes pool status, version, uptime
   if (req.url === "/health") {
     const poolStatus = {};
     for (const [model, arr] of pool) {
-      poolStatus[model] = { total: arr.length, ready: arr.filter(e => e.ready).length };
+      const readyCount = arr.filter(e => e.ready).length;
+      const errorCount = arr.filter(e => !e.ready).length;
+      poolStatus[model] = {
+        total: arr.length,
+        ready: readyCount,
+        error: errorCount,
+        status: readyCount > 0 ? "ready" : "error",
+      };
     }
-    return jsonResponse(res, 200, { status: "ok", pool: poolStatus });
+    const uptimeMs = Date.now() - START_TIME;
+    return jsonResponse(res, 200, {
+      status: "ok",
+      version: VERSION,
+      uptime: uptimeMs,
+      uptimeHuman: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m ${Math.floor((uptimeMs % 60000) / 1000)}s`,
+      pool: poolStatus,
+    });
   }
 
   // Catch-all: try to handle any POST with messages
@@ -312,8 +329,8 @@ const server = createServer(async (req, res) => {
 // ── Start ──────────────────────────────────────────────────────────────
 initPool();
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openclaw-claude-proxy v1.3.1 listening on http://127.0.0.1:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`openclaw-claude-proxy v${VERSION} listening on http://0.0.0.0:${PORT}`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT}ms`);

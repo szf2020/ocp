@@ -1,0 +1,8 @@
+.git
+.gitignore
+*.md
+node_modules
+.env
+.env.*
+scripts/
+start.sh
