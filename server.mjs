@@ -15,6 +15,7 @@
  *   CLAUDE_BIN         — path to claude binary (default: "claude")
  *   CLAUDE_TIMEOUT     — per-request timeout in ms (default: 120000)
  *   CLAUDE_POOL_SIZE   — warm process pool size per model (default: 1)
+ *   PROXY_API_KEY      — Bearer token for API authentication (optional, if unset auth is disabled)
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -31,6 +32,7 @@ const CLAUDE = process.env.CLAUDE_BIN || "claude";
 const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
 const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "1", 10);
 const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
+const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
@@ -399,6 +401,15 @@ const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
+  // Bearer token auth (skip for /health and when PROXY_API_KEY is not set)
+  if (PROXY_API_KEY && req.url !== "/health") {
+    const auth = req.headers["authorization"] || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (token !== PROXY_API_KEY) {
+      return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
+    }
+  }
+
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
     return jsonResponse(res, 200, {
@@ -455,4 +466,5 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT}ms`);
   console.log(`Pool size: ${POOL_SIZE} per model, max idle: ${POOL_MAX_IDLE / 1000}s`);
+  console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
 });
