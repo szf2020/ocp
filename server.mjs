@@ -68,8 +68,10 @@ const pool = new Map(); // model → [{ proc, ready }]
 
 // Exponential backoff state per model: tracks consecutive fast failures
 // to prevent a tight spawn/die loop when workers crash on startup.
-// Delays: 0s (1st), 1s (2nd), 5s (3rd), 30s (4th+)
-const poolBackoff = new Map(); // model → { failures: number, timer: TimeoutId|null }
+// Delays: 2s base, doubled each failure, capped at 60s.
+// After 5 consecutive fast crashes (each lived < 10s, all within 60s),
+// the model is marked "degraded" and respawning stops entirely.
+const poolBackoff = new Map(); // model → { failures: number, timer: TimeoutId|null, degraded: boolean, windowStart: number }
 
 function spawnWarm(cliModel) {
   const env = { ...process.env };
@@ -105,12 +107,14 @@ function spawnWarm(cliModel) {
       console.error(`[pool] worker stderr model=${cliModel} exit=${code} lived=${livedMs}ms: ${stderrBuf.slice(0, 500)}`);
     }
 
-    // If the process survived > 10s, it was healthy — reset the backoff counter
+    // If the process survived > 10s, it was healthy — reset the backoff counter and window
     if (livedMs > 10000) {
       const state = poolBackoff.get(cliModel);
-      if (state && state.failures > 0) {
+      if (state && (state.failures > 0 || state.degraded)) {
         console.log(`[pool] resetting backoff for model=${cliModel} (lived ${livedMs}ms)`);
         state.failures = 0;
+        state.degraded = false;
+        state.windowStart = Date.now();
       }
     }
 
@@ -120,8 +124,9 @@ function spawnWarm(cliModel) {
       const idx = arr.indexOf(entry);
       if (idx !== -1) arr.splice(idx, 1);
     }
-    // Replenish with backoff
-    replenishPool(cliModel);
+    // Replenish: treat as crash (apply backoff) only if it died fast (< 10s)
+    const isCrash = livedMs <= 10000;
+    replenishPool(cliModel, isCrash);
   });
 
   return entry;
@@ -144,12 +149,26 @@ function recycleStaleProcesses() {
 
 setInterval(recycleStaleProcesses, 15000); // check every 15s
 
-function replenishPool(cliModel) {
+const BACKOFF_BASE_MS = 2000;   // 2s starting delay
+const BACKOFF_MAX_MS = 60000;   // 60s ceiling
+const CRASH_LIMIT = 5;          // max consecutive fast crashes before degraded
+const CRASH_WINDOW_MS = 60000;  // window for counting consecutive fast crashes (60s)
+
+// replenishPool(cliModel, isCrash)
+//   isCrash=false → initial or manual fill, no backoff applied
+//   isCrash=true  → called from exit handler after a fast crash
+function replenishPool(cliModel, isCrash = false) {
   if (!pool.has(cliModel)) pool.set(cliModel, []);
-  if (!poolBackoff.has(cliModel)) poolBackoff.set(cliModel, { failures: 0, timer: null });
+  if (!poolBackoff.has(cliModel)) poolBackoff.set(cliModel, { failures: 0, timer: null, degraded: false, windowStart: Date.now() });
 
   const arr = pool.get(cliModel);
   const state = poolBackoff.get(cliModel);
+
+  // If this model is degraded (too many consecutive fast crashes), stop respawning
+  if (state.degraded) {
+    console.error(`[pool] DEGRADED: model=${cliModel} will not be respawned. Restart the proxy to retry.`);
+    return;
+  }
 
   const alive = arr.filter((e) => e.ready).length;
   const needed = POOL_SIZE - alive;
@@ -161,34 +180,56 @@ function replenishPool(cliModel) {
     state.timer = null;
   }
 
-  // Determine backoff delay based on consecutive fast-failure count
-  let delayMs = 0;
-  if (state.failures === 1) delayMs = 1000;
-  else if (state.failures === 2) delayMs = 5000;
-  else if (state.failures >= 3) {
-    delayMs = 30000;
-    console.warn(`[pool] WARNING: model=${cliModel} has failed ${state.failures} times consecutively; backing off ${delayMs / 1000}s before next spawn`);
+  // Only track failures and apply backoff when this is a crash respawn
+  if (!isCrash) {
+    // Immediate spawn — no backoff on initial fill or manual replenish
+    const currentAlive = arr.filter((e) => e.ready).length;
+    const currentNeeded = POOL_SIZE - currentAlive;
+    for (let i = 0; i < currentNeeded; i++) {
+      const entry = spawnWarm(cliModel);
+      arr.push(entry);
+      console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length})`);
+    }
+    return;
+  }
+
+  // --- Crash path: apply exponential backoff and degraded-state logic ---
+
+  const now = Date.now();
+
+  // Reset window if the last crash was outside the rolling window
+  if ((now - state.windowStart) > CRASH_WINDOW_MS) {
+    state.windowStart = now;
+    state.failures = 0;
   }
 
   state.failures += 1;
 
-  const doSpawn = () => {
+  // Check if we've hit the crash limit within the rolling window
+  if (state.failures >= CRASH_LIMIT) {
+    state.degraded = true;
+    console.error(
+      `[pool] DEGRADED: model=${cliModel} crashed ${state.failures} times in ` +
+      `${Math.round((now - state.windowStart) / 1000)}s. ` +
+      `Stopping respawn to prevent CPU spin. Restart the proxy to retry.`
+    );
+    return;
+  }
+
+  // Exponential backoff: 2s, 4s, 8s, 16s, 32s … capped at 60s
+  const delayMs = Math.min(BACKOFF_BASE_MS * Math.pow(2, state.failures - 1), BACKOFF_MAX_MS);
+  console.warn(`[pool] backoff model=${cliModel} delay=${delayMs}ms (failures=${state.failures}/${CRASH_LIMIT})`);
+
+  state.timer = setTimeout(() => {
     state.timer = null;
     const currentAlive = arr.filter((e) => e.ready).length;
     const currentNeeded = POOL_SIZE - currentAlive;
     for (let i = 0; i < currentNeeded; i++) {
       const entry = spawnWarm(cliModel);
       arr.push(entry);
-      console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length}, failures=${state.failures})`);
+      console.log(`[pool] re-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length}, failures=${state.failures}/${CRASH_LIMIT})`);
     }
-  };
-
-  if (delayMs > 0) {
-    console.log(`[pool] backoff model=${cliModel} delay=${delayMs}ms (failures=${state.failures})`);
-    state.timer = setTimeout(doSpawn, delayMs);
-  } else {
-    doSpawn();
-  }
+  }, delayMs);
 }
 
 function getWarmProcess(cliModel) {
