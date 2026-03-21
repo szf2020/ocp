@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.2.0 — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy v2.3.0 — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
