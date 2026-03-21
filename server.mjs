@@ -1,29 +1,29 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.3.1 — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy v2.4.0 — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
- * v2.0.0 highlights:
- *   - On-demand spawning: eliminates pool crash loops from v1.x
- *   - Session management: --resume support reduces token waste on multi-turn
- *   - Full tool access: configurable allowedTools (expanded defaults)
- *   - System prompt & MCP config pass-through
- *   - Concurrency control with queuing
- *   - Coexists safely with Claude Code interactive mode (Telegram, IDE, etc.)
+ * v2.4.0:
+ *   - Per-model circuit breaker: consecutive timeouts temporarily mark a model as degraded
+ *   - Adaptive first-byte timeout: scales by model tier + prompt size
+ *   - Structured JSON logging for key events (easier to parse/alert on)
+ *   - On-demand spawning (no pool), session management, full tool access
  *
  * Env vars:
  *   CLAUDE_PROXY_PORT        — listen port (default: 3456)
  *   CLAUDE_BIN               — path to claude binary (default: auto-detect)
  *   CLAUDE_TIMEOUT           — per-request timeout in ms (default: 120000)
- *   CLAUDE_FIRST_BYTE_TIMEOUT — abort if no stdout within this ms (default: 30000)
+ *   CLAUDE_FIRST_BYTE_TIMEOUT — base first-byte timeout in ms (default: 45000)
  *   CLAUDE_ALLOWED_TOOLS     — comma-separated tools to allow (default: expanded set)
  *   CLAUDE_SKIP_PERMISSIONS  — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT     — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG        — path to MCP server config JSON file
  *   CLAUDE_SESSION_TTL       — session TTL in ms (default: 3600000 = 1h)
  *   CLAUDE_MAX_CONCURRENT    — max concurrent claude processes (default: 5)
+ *   CLAUDE_BREAKER_THRESHOLD — consecutive timeouts before circuit opens (default: 3)
+ *   CLAUDE_BREAKER_COOLDOWN  — ms to wait before retrying after circuit opens (default: 60000)
  *   PROXY_API_KEY            — Bearer token for API auth (optional)
  */
 import { createServer } from "node:http";
@@ -87,9 +87,64 @@ const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 const SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "5", 10);
+const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "3", 10);
+const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "60000", 10);
 
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
+
+// ── Structured logging helper ───────────────────────────────────────────
+function logEvent(level, event, data = {}) {
+  const entry = { ts: new Date().toISOString(), level, event, ...data };
+  if (level === "error" || level === "warn") {
+    console.error(JSON.stringify(entry));
+  } else {
+    console.log(JSON.stringify(entry));
+  }
+}
+
+// ── Per-model circuit breaker ───────────────────────────────────────────
+// Tracks consecutive timeouts per model. When threshold is reached, the
+// model is marked "open" (degraded) for BREAKER_COOLDOWN ms. During that
+// window, requests for this model fail fast with a clear error instead of
+// waiting for yet another timeout that would block the gateway.
+const breakers = new Map(); // cliModel → { failures, state, openedAt }
+
+function getBreakerState(cliModel) {
+  if (!breakers.has(cliModel)) {
+    breakers.set(cliModel, { failures: 0, state: "closed", openedAt: 0 });
+  }
+  const b = breakers.get(cliModel);
+
+  // Auto-recover: if cooldown has elapsed, transition to half-open
+  if (b.state === "open" && Date.now() - b.openedAt >= BREAKER_COOLDOWN) {
+    b.state = "half-open";
+    logEvent("info", "breaker_half_open", { model: cliModel, cooldownMs: BREAKER_COOLDOWN });
+  }
+  return b;
+}
+
+function breakerRecordSuccess(cliModel) {
+  const b = getBreakerState(cliModel);
+  if (b.failures > 0 || b.state !== "closed") {
+    logEvent("info", "breaker_reset", { model: cliModel, previousFailures: b.failures, previousState: b.state });
+  }
+  b.failures = 0;
+  b.state = "closed";
+  b.openedAt = 0;
+}
+
+function breakerRecordTimeout(cliModel) {
+  const b = getBreakerState(cliModel);
+  b.failures++;
+  logEvent("warn", "breaker_failure", { model: cliModel, consecutiveFailures: b.failures, threshold: BREAKER_THRESHOLD });
+
+  if (b.failures >= BREAKER_THRESHOLD && b.state !== "open") {
+    b.state = "open";
+    b.openedAt = Date.now();
+    logEvent("error", "breaker_open", { model: cliModel, failures: b.failures, cooldownMs: BREAKER_COOLDOWN });
+  }
+}
 
 // ── Model mapping ───────────────────────────────────────────────────────
 // Maps request model IDs and aliases to canonical claude CLI model IDs.
@@ -210,13 +265,23 @@ function messagesToPrompt(messages) {
   }).join("\n\n");
 }
 
+// Model tier multipliers for first-byte timeout.
+// Opus is much slower to produce first token, especially with large contexts.
+const MODEL_TIMEOUT_TIERS = {
+  "opus": { base: 60000, perPromptChar: 0.00015 },    // 60s base + ~15s per 100k chars
+  "sonnet": { base: 45000, perPromptChar: 0.00008 },  // 45s base + ~8s per 100k chars
+  "haiku": { base: 30000, perPromptChar: 0.00005 },   // 30s base + ~5s per 100k chars
+};
+
+function getModelTier(cliModel) {
+  if (cliModel.includes("opus")) return "opus";
+  if (cliModel.includes("haiku")) return "haiku";
+  return "sonnet";
+}
+
 function computeFirstByteTimeout(cliModel, promptLength) {
-  let timeout = BASE_FIRST_BYTE_TIMEOUT;
-
-  if (cliModel.includes("opus")) timeout += 15000;
-  if (promptLength >= 120000) timeout += 15000;
-  if (promptLength >= 200000) timeout += 15000;
-
+  const tier = MODEL_TIMEOUT_TIERS[getModelTier(cliModel)];
+  const timeout = tier.base + Math.floor(promptLength * tier.perPromptChar);
   return Math.min(timeout, Math.max(TIMEOUT - 5000, 10000));
 }
 
@@ -229,10 +294,20 @@ function callClaude(model, messages, conversationId) {
     if (stats.activeRequests >= MAX_CONCURRENT) {
       return reject(new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`));
     }
+
+    const cliModel = MODEL_MAP[model] || model;
+
+    // Circuit breaker check: fail fast if model is in open state
+    const breaker = getBreakerState(cliModel);
+    if (breaker.state === "open") {
+      const remainingMs = BREAKER_COOLDOWN - (Date.now() - breaker.openedAt);
+      logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs });
+      return reject(new Error(`circuit breaker open for ${cliModel}: ${breaker.failures} consecutive timeouts, retry in ${Math.ceil(remainingMs / 1000)}s`));
+    }
+
     stats.activeRequests++;
     stats.totalRequests++;
 
-    const cliModel = MODEL_MAP[model] || model;
     let sessionInfo = null;
     let prompt;
 
@@ -320,14 +395,15 @@ function callClaude(model, messages, conversationId) {
     proc.on("close", (code, signal) => {
       const elapsed = Date.now() - t0;
       if (settled) {
-        console.warn(`[claude] late close ignored model=${cliModel} code=${code} signal=${signal || "none"} elapsed=${elapsed}ms`);
+        logEvent("warn", "late_close", { model: cliModel, code, signal: signal || "none", elapsed });
         return;
       }
       if (code !== 0) {
-        console.error(`[claude] exit=${code} signal=${signal || "none"} model=${cliModel} elapsed=${elapsed}ms stderr=${stderr.slice(0, 500)}`);
+        logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
         settle(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
       } else {
-        console.log(`[claude] ok model=${cliModel} chars=${stdout.length} elapsed=${elapsed}ms session=${conversationId ? conversationId.slice(0, 12) + "..." : "none"}`);
+        breakerRecordSuccess(cliModel);
+        logEvent("info", "claude_ok", { model: cliModel, chars: stdout.length, elapsed, session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
         settle(null, stdout.trim());
       }
     });
@@ -341,13 +417,14 @@ function callClaude(model, messages, conversationId) {
     proc.stdin.write(prompt);
     proc.stdin.end();
 
-    console.log(`[claude] spawned model=${cliModel} prompt_chars=${prompt.length} first_byte_timeout=${firstByteTimeoutMs}ms session=${conversationId ? conversationId.slice(0, 12) + "..." : "none"}`);
+    logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, firstByteTimeout: firstByteTimeoutMs, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
     // First-byte timeout: abort early if Claude CLI produces no output
     const firstByteTimer = setTimeout(() => {
       if (!gotFirstByte && !settled) {
         stats.timeouts++;
-        console.error(`[claude] first-byte timeout after ${firstByteTimeoutMs}ms model=${cliModel} prompt_chars=${prompt.length} — aborting`);
+        breakerRecordTimeout(cliModel);
+        logEvent("error", "first_byte_timeout", { model: cliModel, timeoutMs: firstByteTimeoutMs, promptChars: prompt.length });
         try { proc.kill("SIGTERM"); } catch {}
         setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
         settle(new Error(`first-byte timeout after ${firstByteTimeoutMs}ms`));
@@ -358,7 +435,8 @@ function callClaude(model, messages, conversationId) {
     const timer = setTimeout(() => {
       if (settled) return;
       stats.timeouts++;
-      console.error(`[claude] timeout after ${TIMEOUT}ms model=${cliModel}`);
+      breakerRecordTimeout(cliModel);
+      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT });
       try { proc.kill("SIGTERM"); } catch {}
       setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
       settle(new Error(`timeout after ${TIMEOUT}ms`));
