@@ -1,9 +1,18 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.4.0 — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy v2.5.0 — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
+ *
+ * v2.5.0:
+ *   - Sliding-window circuit breaker: uses time-windowed failure rate instead of
+ *     consecutive-count, preventing multi-agent burst scenarios from tripping the
+ *     breaker too aggressively. Half-open state allows configurable probe requests.
+ *   - Graduated backoff: cooldown doubles on each re-open (capped at 5min),
+ *     resets fully on success.
+ *   - Health endpoint now exposes per-model breaker state and sliding window stats.
+ *   - Increased default timeout tiers for Opus/Sonnet to handle large agent prompts.
  *
  * v2.4.0:
  *   - Per-model circuit breaker: consecutive timeouts temporarily mark a model as degraded
@@ -12,19 +21,21 @@
  *   - On-demand spawning (no pool), session management, full tool access
  *
  * Env vars:
- *   CLAUDE_PROXY_PORT        — listen port (default: 3456)
- *   CLAUDE_BIN               — path to claude binary (default: auto-detect)
- *   CLAUDE_TIMEOUT           — per-request timeout in ms (default: 120000)
- *   CLAUDE_FIRST_BYTE_TIMEOUT — base first-byte timeout in ms (default: 45000)
- *   CLAUDE_ALLOWED_TOOLS     — comma-separated tools to allow (default: expanded set)
- *   CLAUDE_SKIP_PERMISSIONS  — "true" to bypass all permission checks (default: false)
- *   CLAUDE_SYSTEM_PROMPT     — system prompt appended to all requests
- *   CLAUDE_MCP_CONFIG        — path to MCP server config JSON file
- *   CLAUDE_SESSION_TTL       — session TTL in ms (default: 3600000 = 1h)
- *   CLAUDE_MAX_CONCURRENT    — max concurrent claude processes (default: 5)
- *   CLAUDE_BREAKER_THRESHOLD — consecutive timeouts before circuit opens (default: 3)
- *   CLAUDE_BREAKER_COOLDOWN  — ms to wait before retrying after circuit opens (default: 60000)
- *   PROXY_API_KEY            — Bearer token for API auth (optional)
+ *   CLAUDE_PROXY_PORT            — listen port (default: 3456)
+ *   CLAUDE_BIN                   — path to claude binary (default: auto-detect)
+ *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 300000)
+ *   CLAUDE_FIRST_BYTE_TIMEOUT    — base first-byte timeout in ms (default: 90000)
+ *   CLAUDE_ALLOWED_TOOLS         — comma-separated tools to allow (default: expanded set)
+ *   CLAUDE_SKIP_PERMISSIONS      — "true" to bypass all permission checks (default: false)
+ *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
+ *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
+ *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
+ *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes (default: 8)
+ *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
+ *   CLAUDE_BREAKER_COOLDOWN      — base ms to wait before retrying after circuit opens (default: 120000)
+ *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
+ *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
+ *   PROXY_API_KEY                — Bearer token for API auth (optional)
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
@@ -76,8 +87,8 @@ function resolveClaude() {
 // ── Configuration ───────────────────────────────────────────────────────
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
-const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "120000", 10);
-const BASE_FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "45000", 10);
+const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
+const BASE_FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "90000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
@@ -86,9 +97,11 @@ const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 const SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
-const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "5", 10);
-const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "3", 10);
-const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "60000", 10);
+const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
+const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 10);
+const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
+const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
+const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
 
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
@@ -103,47 +116,128 @@ function logEvent(level, event, data = {}) {
   }
 }
 
-// ── Per-model circuit breaker ───────────────────────────────────────────
-// Tracks consecutive timeouts per model. When threshold is reached, the
-// model is marked "open" (degraded) for BREAKER_COOLDOWN ms. During that
-// window, requests for this model fail fast with a clear error instead of
-// waiting for yet another timeout that would block the gateway.
-const breakers = new Map(); // cliModel → { failures, state, openedAt }
+// ── Per-model sliding-window circuit breaker ─────────────────────────────
+// Uses a time-windowed failure rate instead of consecutive-count. This prevents
+// multi-agent burst scenarios (e.g. ClawTeam spawning 5+ Opus agents) from
+// tripping the breaker after just 3 quick timeouts.
+//
+// States: closed → open → half-open → closed (on success) or open (on failure)
+// Half-open allows up to BREAKER_HALF_OPEN_MAX concurrent probes (not just 1).
+// Cooldown uses graduated backoff: doubles on each re-open, resets on success.
+const breakers = new Map(); // cliModel → BreakerState
+
+function newBreakerState() {
+  return {
+    state: "closed",        // closed | open | half-open
+    failureTimestamps: [],  // timestamps of failures within the sliding window
+    successCount: 0,        // successes within window (for rate calculation)
+    openedAt: 0,
+    currentCooldown: BREAKER_COOLDOWN, // graduates on repeated opens
+    reopenCount: 0,         // how many times breaker has re-opened without a full reset
+    halfOpenProbes: 0,      // active probe requests in half-open state
+  };
+}
+
+function pruneWindow(b) {
+  const cutoff = Date.now() - BREAKER_WINDOW;
+  b.failureTimestamps = b.failureTimestamps.filter(ts => ts > cutoff);
+}
 
 function getBreakerState(cliModel) {
   if (!breakers.has(cliModel)) {
-    breakers.set(cliModel, { failures: 0, state: "closed", openedAt: 0 });
+    breakers.set(cliModel, newBreakerState());
   }
   const b = breakers.get(cliModel);
 
   // Auto-recover: if cooldown has elapsed, transition to half-open
-  if (b.state === "open" && Date.now() - b.openedAt >= BREAKER_COOLDOWN) {
+  if (b.state === "open" && Date.now() - b.openedAt >= b.currentCooldown) {
     b.state = "half-open";
-    logEvent("info", "breaker_half_open", { model: cliModel, cooldownMs: BREAKER_COOLDOWN });
+    b.halfOpenProbes = 0;
+    logEvent("info", "breaker_half_open", { model: cliModel, cooldownMs: b.currentCooldown, reopenCount: b.reopenCount });
   }
   return b;
 }
 
 function breakerRecordSuccess(cliModel) {
   const b = getBreakerState(cliModel);
-  if (b.failures > 0 || b.state !== "closed") {
-    logEvent("info", "breaker_reset", { model: cliModel, previousFailures: b.failures, previousState: b.state });
+  b.successCount++;
+
+  if (b.state === "half-open") {
+    b.halfOpenProbes = Math.max(0, b.halfOpenProbes - 1);
   }
-  b.failures = 0;
-  b.state = "closed";
-  b.openedAt = 0;
+
+  if (b.state !== "closed") {
+    logEvent("info", "breaker_reset", {
+      model: cliModel,
+      previousFailures: b.failureTimestamps.length,
+      previousState: b.state,
+      reopenCount: b.reopenCount,
+    });
+    // Full reset on success — graduated backoff resets too
+    b.state = "closed";
+    b.openedAt = 0;
+    b.currentCooldown = BREAKER_COOLDOWN;
+    b.reopenCount = 0;
+    b.halfOpenProbes = 0;
+    b.failureTimestamps = [];
+    b.successCount = 0;
+  }
 }
 
 function breakerRecordTimeout(cliModel) {
   const b = getBreakerState(cliModel);
-  b.failures++;
-  logEvent("warn", "breaker_failure", { model: cliModel, consecutiveFailures: b.failures, threshold: BREAKER_THRESHOLD });
+  const now = Date.now();
+  b.failureTimestamps.push(now);
+  pruneWindow(b);
 
-  if (b.failures >= BREAKER_THRESHOLD && b.state !== "open") {
-    b.state = "open";
-    b.openedAt = Date.now();
-    logEvent("error", "breaker_open", { model: cliModel, failures: b.failures, cooldownMs: BREAKER_COOLDOWN });
+  if (b.state === "half-open") {
+    b.halfOpenProbes = Math.max(0, b.halfOpenProbes - 1);
   }
+
+  const windowFailures = b.failureTimestamps.length;
+  logEvent("warn", "breaker_failure", {
+    model: cliModel,
+    windowFailures,
+    threshold: BREAKER_THRESHOLD,
+    windowMs: BREAKER_WINDOW,
+    state: b.state,
+  });
+
+  if (windowFailures >= BREAKER_THRESHOLD && b.state !== "open") {
+    b.state = "open";
+    b.openedAt = now;
+    b.halfOpenProbes = 0;
+    // Graduated backoff: double cooldown on each re-open, cap at 5 min
+    if (b.reopenCount > 0) {
+      b.currentCooldown = Math.min(b.currentCooldown * 2, 300000);
+    }
+    b.reopenCount++;
+    logEvent("error", "breaker_open", {
+      model: cliModel,
+      windowFailures,
+      cooldownMs: b.currentCooldown,
+      reopenCount: b.reopenCount,
+    });
+  }
+}
+
+// Expose breaker snapshot for /health endpoint
+function getBreakerSnapshot() {
+  const snapshot = {};
+  for (const [model, b] of breakers) {
+    pruneWindow(b);
+    snapshot[model] = {
+      state: b.state,
+      windowFailures: b.failureTimestamps.length,
+      threshold: BREAKER_THRESHOLD,
+      windowMs: BREAKER_WINDOW,
+      currentCooldown: b.currentCooldown,
+      reopenCount: b.reopenCount,
+      halfOpenProbes: b.halfOpenProbes,
+      ...(b.openedAt ? { openedAt: new Date(b.openedAt).toISOString() } : {}),
+    };
+  }
+  return snapshot;
 }
 
 // ── Model mapping ───────────────────────────────────────────────────────
@@ -271,8 +365,8 @@ function messagesToPrompt(messages) {
 // Model tier multipliers for first-byte timeout.
 // Opus is much slower to produce first token, especially with large contexts.
 const MODEL_TIMEOUT_TIERS = {
-  "opus": { base: 60000, perPromptChar: 0.00015 },    // 60s base + ~15s per 100k chars
-  "sonnet": { base: 45000, perPromptChar: 0.00008 },  // 45s base + ~8s per 100k chars
+  "opus": { base: 90000, perPromptChar: 0.00020 },    // 90s base + ~20s per 100k chars
+  "sonnet": { base: 60000, perPromptChar: 0.00010 },  // 60s base + ~10s per 100k chars
   "haiku": { base: 30000, perPromptChar: 0.00005 },   // 30s base + ~5s per 100k chars
 };
 
@@ -301,9 +395,18 @@ function spawnClaudeProcess(model, messages, conversationId) {
   // Circuit breaker check: fail fast if model is in open state
   const breaker = getBreakerState(cliModel);
   if (breaker.state === "open") {
-    const remainingMs = BREAKER_COOLDOWN - (Date.now() - breaker.openedAt);
-    logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs });
-    throw new Error(`circuit breaker open for ${cliModel}: ${breaker.failures} consecutive timeouts, retry in ${Math.ceil(remainingMs / 1000)}s`);
+    const remainingMs = breaker.currentCooldown - (Date.now() - breaker.openedAt);
+    logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs, reopenCount: breaker.reopenCount });
+    throw new Error(`circuit breaker open for ${cliModel}: ${breaker.failureTimestamps.length} timeouts in window, retry in ${Math.ceil(remainingMs / 1000)}s`);
+  }
+  // Half-open: allow limited probe requests
+  if (breaker.state === "half-open" && breaker.halfOpenProbes >= BREAKER_HALF_OPEN_MAX) {
+    logEvent("warn", "breaker_half_open_full", { model: cliModel, activeProbes: breaker.halfOpenProbes, max: BREAKER_HALF_OPEN_MAX });
+    throw new Error(`circuit breaker half-open for ${cliModel}: ${breaker.halfOpenProbes}/${BREAKER_HALF_OPEN_MAX} probe slots in use, wait for probe result`);
+  }
+  if (breaker.state === "half-open") {
+    breaker.halfOpenProbes++;
+    logEvent("info", "breaker_probe", { model: cliModel, activeProbes: breaker.halfOpenProbes, max: BREAKER_HALF_OPEN_MAX });
   }
 
   stats.activeRequests++;
@@ -696,8 +799,11 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    const breakerState = getBreakerSnapshot();
+    const anyBreakerOpen = Object.values(breakerState).some(b => b.state === "open");
+
     return jsonResponse(res, 200, {
-      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
+      status: binaryOk && authStatus.ok !== false && !anyBreakerOpen ? "ok" : "degraded",
       version: VERSION,
       architecture: "on-demand (v2)",
       uptime: uptimeMs,
@@ -710,11 +816,16 @@ const server = createServer(async (req, res) => {
         firstByteTimeout: BASE_FIRST_BYTE_TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
         sessionTTL: SESSION_TTL,
+        breakerThreshold: BREAKER_THRESHOLD,
+        breakerCooldown: BREAKER_COOLDOWN,
+        breakerWindow: BREAKER_WINDOW,
+        breakerHalfOpenMax: BREAKER_HALF_OPEN_MAX,
         allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
         systemPrompt: SYSTEM_PROMPT ? `${SYSTEM_PROMPT.slice(0, 50)}...` : "(none)",
         mcpConfig: MCP_CONFIG || "(none)",
       },
       stats,
+      breakers: breakerState,
       sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
     });
@@ -799,6 +910,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT}ms (base first-byte: ${BASE_FIRST_BYTE_TIMEOUT}ms, adaptive by model/prompt) | Max concurrent: ${MAX_CONCURRENT}`);
+  console.log(`Circuit breaker: threshold=${BREAKER_THRESHOLD} in ${BREAKER_WINDOW/1000}s window, cooldown=${BREAKER_COOLDOWN/1000}s (graduated), half-open probes=${BREAKER_HALF_OPEN_MAX}`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
