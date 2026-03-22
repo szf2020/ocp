@@ -4,6 +4,40 @@
 
 A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run.
 
+## v2.5.0 — Emergency Fix: Sliding-Window Circuit Breaker
+
+**Incident (2026-03-22):** Multi-agent burst (ClawTeam with 5+ Opus agents) caused cascading timeout failure. The old consecutive-count circuit breaker (threshold=3) tripped within seconds, blocking ALL requests globally — including unrelated agents and new sessions. With fallback models removed, this resulted in complete service outage ("LLM request timed out." on every message).
+
+**Root cause:** v2.4.0's circuit breaker counted consecutive failures per model. When ClawTeam spawned multiple concurrent Opus agents and Claude API had moderate latency, 3 quick timeouts opened the breaker for the entire model. With `fallbacks: []`, the gateway had no alternative path.
+
+**What's new in v2.5.0:**
+- **Sliding-window circuit breaker** — counts failures in a 5-minute window (default: 6 failures) instead of 3 consecutive. Multi-agent bursts no longer trip the breaker instantly.
+- **Graduated backoff** — cooldown doubles on each re-open (120s → 240s → 300s cap), resets fully on first success. Prevents oscillation between open/half-open during extended API issues.
+- **Multi-probe half-open** — allows 2 concurrent probe requests in half-open state (was 1), improving recovery speed.
+- **Increased default timeouts** — Opus first-byte 60s→90s, Sonnet 45s→60s, overall 120s→300s, max concurrent 5→8. Designed for large agent system prompts (30K+ chars).
+- **Health endpoint shows breaker state** — `/health` now exposes per-model breaker state (window failures, cooldown, reopen count). Status is "degraded" when any breaker is open.
+
+**New env vars:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_BREAKER_WINDOW` | `300000` | Sliding window duration (ms) for failure counting |
+| `CLAUDE_BREAKER_HALF_OPEN_MAX` | `2` | Max concurrent probe requests in half-open state |
+
+**Updated defaults:**
+
+| Variable | Old Default | New Default |
+|----------|-------------|-------------|
+| `CLAUDE_TIMEOUT` | `120000` | `300000` |
+| `CLAUDE_FIRST_BYTE_TIMEOUT` | `45000` | `90000` |
+| `CLAUDE_MAX_CONCURRENT` | `5` | `8` |
+| `CLAUDE_BREAKER_THRESHOLD` | `3` | `6` |
+| `CLAUDE_BREAKER_COOLDOWN` | `60000` | `120000` |
+
+**Upgrade:** Pull latest and restart the proxy. The new defaults take effect immediately. If you have custom env vars set in your plist/service file, review and adjust them.
+
+---
+
 ## v2.0.0 — Major Upgrade
 
 **What's new:**
@@ -174,13 +208,18 @@ openclaw gateway restart
 |----------|---------|-------------|
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
-| `CLAUDE_TIMEOUT` | `300000` | Request timeout (ms) |
+| `CLAUDE_TIMEOUT` | `300000` | Overall request timeout (ms) |
+| `CLAUDE_FIRST_BYTE_TIMEOUT` | `90000` | Base first-byte timeout (ms), adaptive by model tier |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Set `true` to bypass all permission checks |
 | `CLAUDE_SYSTEM_PROMPT` | *(empty)* | System prompt appended to all requests |
 | `CLAUDE_MCP_CONFIG` | *(empty)* | Path to MCP server config JSON file |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry in ms (default: 1 hour) |
-| `CLAUDE_MAX_CONCURRENT` | `5` | Max concurrent claude processes |
+| `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
+| `CLAUDE_BREAKER_THRESHOLD` | `6` | Failures in window before circuit opens |
+| `CLAUDE_BREAKER_COOLDOWN` | `120000` | Base cooldown (ms) before half-open (graduates on re-open) |
+| `CLAUDE_BREAKER_WINDOW` | `300000` | Sliding window duration (ms) for failure counting |
+| `CLAUDE_BREAKER_HALF_OPEN_MAX` | `2` | Max concurrent probe requests in half-open state |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for API authentication |
 
 ## API Endpoints
