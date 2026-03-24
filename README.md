@@ -165,6 +165,21 @@ Add to `~/.openclaw/openclaw.json`:
 
 Restart the gateway: `openclaw gateway restart`
 
+### Upgrading from v2.x (skill-based /ocp)
+
+If you previously used the skill-based `/ocp` command (via `skills/ocp/SKILL.md`), remove it to avoid conflicts:
+
+```bash
+# Remove the old skill
+rm -rf ~/.openclaw/workspace/main/skills/ocp
+
+# Restart gateway
+launchctl kickstart -k gui/501/ai.openclaw.gateway  # macOS
+# or: systemctl --user restart openclaw-gateway       # Linux
+```
+
+**Why?** The old skill routed `/ocp` to the agent as a prompt (slow, costs tokens). The new plugin handles commands directly in the gateway (instant, free). If both exist, the skill takes priority and you get "Unknown skill" errors.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
