@@ -1,17 +1,11 @@
 #!/usr/bin/env node
 /**
- * OCP (OpenClaw Control Plane) v4.0-alpha
+ * openclaw-claude-proxy v2.5.0 — OpenAI-compatible proxy for Claude CLI
  *
- * Cost-control and model-routing layer for AI agents.
- * Currently supports Claude CLI backend; architecture supports multiple backends.
+ * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
+ * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
- * v4.0-alpha:
- *   - Internal modular architecture: BackendAdapter, ModelRegistry, AgentRouter,
- *     SessionManager, StatsCollector
- *   - External API unchanged from v2.5.0
- *   - Claude CLI backend extracted to ClaudeCliAdapter
- *
- * v2.5.0 (legacy notes):
+ * v2.5.0:
  *   - Sliding-window circuit breaker: uses time-windowed failure rate instead of
  *     consecutive-count, preventing multi-agent burst scenarios from tripping the
  *     breaker too aggressively. Half-open state allows configurable probe requests.
@@ -52,54 +46,6 @@ import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
-
-// ── v4 Modular Architecture (Step 1: load + initialize, hot path unchanged) ──
-import { ClaudeCliAdapter } from "./backends/claude-cli.mjs";
-import { ModelRegistry } from "./model-registry.mjs";
-import { AgentRouter } from "./agent-router.mjs";
-import { SessionManager as SessionMgr } from "./session-manager.mjs";
-import { StatsCollector } from "./stats-collector.mjs";
-
-// These modules are initialized at startup but NOT yet wired into the request
-// path. Step 2 will replace the legacy callClaude/callClaudeStreaming with
-// adapter-based calls. For now, they run in parallel for validation.
-let _v4Backend = null;
-let _v4Registry = null;
-let _v4Router = null;
-let _v4Sessions = null;
-let _v4Stats = null;
-
-async function initV4Modules() {
-  try {
-    _v4Stats = new StatsCollector();
-    _v4Sessions = new SessionMgr({ ttl: SESSION_TTL });
-    _v4Registry = new ModelRegistry();
-
-    _v4Backend = new ClaudeCliAdapter({
-      maxConcurrent: MAX_CONCURRENT,
-      timeout: { overall: TIMEOUT },
-      skipPermissions: SKIP_PERMISSIONS,
-      allowedTools: ALLOWED_TOOLS,
-      systemPrompt: SYSTEM_PROMPT,
-      mcpConfig: MCP_CONFIG,
-      timeoutTiers: MODEL_TIMEOUT_TIERS,
-    });
-    await _v4Backend.initialize();
-    _v4Registry.registerBackend(_v4Backend);
-
-    const backends = new Map([["claude-cli", _v4Backend]]);
-    _v4Router = new AgentRouter({
-      registry: _v4Registry,
-      backends,
-      agentConfig: { default: { preferred: "claude-cli", fallback: null } },
-      defaultBackend: "claude-cli",
-    });
-
-    console.log(`[v4] Modules initialized: backend=${_v4Backend.id}, models=${_v4Backend.models.length}, registry=${_v4Registry.listModels().length} models`);
-  } catch (err) {
-    console.error(`[v4] Module init failed (non-fatal, legacy path active): ${err.message}`);
-  }
-}
 
 // ── Resolve claude binary ───────────────────────────────────────────────
 // Priority: CLAUDE_BIN env > well-known paths > which lookup
@@ -740,57 +686,20 @@ function completionResponse(res, id, model, content) {
 let usageCache = { data: null, fetchedAt: 0 };
 const USAGE_CACHE_TTL = 300000; // 5 min
 
-function getOAuthCredentials() {
+function getOAuthToken() {
   try {
     const raw = execFileSync("security", [
       "find-generic-password", "-s", "Claude Code-credentials", "-w"
     ], { encoding: "utf8", timeout: 5000 }).trim();
-    return JSON.parse(raw)?.claudeAiOauth || null;
+    const creds = JSON.parse(raw);
+    return creds?.claudeAiOauth?.accessToken || null;
   } catch {
     return null;
   }
 }
 
-async function refreshOAuthToken(_creds) {
-  // Trigger Claude Code to refresh the token by running a minimal command.
-  // Claude Code automatically refreshes expired tokens on startup.
-  try {
-    execFileSync("claude", ["-p", "--model", "haiku", "--max-turns", "1", "hi"], {
-      encoding: "utf8",
-      timeout: 30000,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    // Re-read the now-refreshed token from keychain
-    const refreshed = getOAuthCredentials();
-    if (refreshed?.accessToken && refreshed.expiresAt > Date.now()) {
-      console.log("[ocp] OAuth token refreshed via Claude CLI");
-      return refreshed.accessToken;
-    }
-    return null;
-  } catch (e) {
-    console.error("[ocp] OAuth refresh via CLI failed:", e.message);
-    return null;
-  }
-}
-
-async function getOAuthToken() {
-  const creds = getOAuthCredentials();
-  if (!creds?.accessToken) return null;
-
-  // Check if token is expired or about to expire (5 min buffer)
-  const expiresAt = creds.expiresAt || 0;
-  if (expiresAt > Date.now() + 300000) {
-    return creds.accessToken;
-  }
-
-  // Token expired or expiring soon — try refresh
-  console.log("[ocp] OAuth token expired, attempting refresh...");
-  const newToken = await refreshOAuthToken(creds);
-  return newToken || creds.accessToken; // fallback to old token (might still work briefly)
-}
-
 async function fetchUsageFromApi() {
-  const token = await getOAuthToken();
+  const token = getOAuthToken();
   if (!token) {
     return { error: "No OAuth token found in keychain" };
   }
@@ -1269,36 +1178,7 @@ const server = createServer(async (req, res) => {
     return handleSettings(req, res);
   }
 
-  // GET /backends — v4 backend status (new endpoint)
-  if (req.url === "/backends" && req.method === "GET") {
-    if (!_v4Backend) {
-      return jsonResponse(res, 503, { error: "v4 modules not initialized" });
-    }
-    const health = await _v4Backend.healthCheck();
-    return jsonResponse(res, 200, {
-      backends: [{
-        id: _v4Backend.id,
-        displayName: _v4Backend.displayName,
-        tier: _v4Backend.tier,
-        costType: _v4Backend.costType,
-        enabled: _v4Backend.enabled,
-        models: _v4Backend.models,
-        activeProcesses: _v4Backend.activeProcessCount,
-        health,
-      }],
-      routing: _v4Router?.getRoutingTable() || {},
-    });
-  }
-
-  // GET /routing — v4 agent routing table (new endpoint)
-  if (req.url === "/routing" && req.method === "GET") {
-    return jsonResponse(res, 200, {
-      table: _v4Router?.getRoutingTable() || {},
-      registry: _v4Registry?.listModels() || [],
-    });
-  }
-
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /backends, GET /routing" });
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions" });
 });
 
 
@@ -1318,10 +1198,6 @@ function gracefulShutdown(signal) {
   // 2. Clear intervals/timers
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
-
-  // 2b. Shutdown v4 modules
-  if (_v4Sessions) _v4Sessions.shutdown();
-  if (_v4Backend) _v4Backend.shutdown().catch(() => {});
 
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
@@ -1359,11 +1235,8 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
-// Initialize v4 modules before listening
-initV4Modules().catch(err => console.error(`[v4] init error: ${err.message}`));
-
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`OCP (OpenClaw Control Plane) v${VERSION} listening on http://127.0.0.1:${PORT}`);
+  console.log(`openclaw-claude-proxy v${VERSION} listening on http://127.0.0.1:${PORT}`);
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
