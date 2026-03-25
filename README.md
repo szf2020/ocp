@@ -1,8 +1,10 @@
-# openclaw-claude-proxy (OCP)
+# OCP — OpenClaw Control Plane
+
+> **Status: Stable (v3.0.0)** — Feature-complete. Bug fixes only, no new development planned.
 
 > **Already paying for Claude Pro/Max? Use it as your OpenClaw model provider — $0 extra API cost.**
 
-A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run. Now with built-in plan usage monitoring, runtime settings, and a CLI.
+A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run. Built-in plan usage monitoring, runtime settings, and a CLI.
 
 ## What's New in v3.0.0
 
@@ -113,8 +115,8 @@ The proxy translates OpenAI-compatible `/v1/chat/completions` requests into `cla
 ## Quick Start
 
 ```bash
-git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
-cd openclaw-claude-proxy
+git clone https://github.com/dtzp555-max/ocp.git
+cd ocp
 
 # Auto-configure OpenClaw + start proxy + install auto-start
 node setup.mjs

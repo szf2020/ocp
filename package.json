@@ -1,7 +1,7 @@
 {
   "name": "openclaw-claude-proxy",
   "version": "3.0.0",
-  "description": "OpenAI-compatible proxy for Claude CLI — plan usage monitoring, runtime settings, prompt truncation, OCP CLI",
+  "description": "OCP (OpenClaw Control Plane) — stable proxy for Claude CLI subscriptions. Plan usage monitoring, runtime settings, prompt truncation, OCP CLI.",
   "type": "module",
   "bin": {
     "openclaw-claude-proxy": "./server.mjs",
@@ -24,6 +24,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/dtzp555-max/openclaw-claude-proxy"
+    "url": "https://github.com/dtzp555-max/ocp"
   }
 }
