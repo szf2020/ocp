@@ -43,6 +43,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -687,6 +688,15 @@ let usageCache = { data: null, fetchedAt: 0 };
 const USAGE_CACHE_TTL = 300000; // 5 min
 
 function getOAuthToken() {
+  // Try Linux file-based credentials first
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    const creds = JSON.parse(readFileSync(credPath, "utf8"));
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (token) return token;
+  } catch { /* fall through to macOS keychain */ }
+
+  // Try macOS keychain
   try {
     const raw = execFileSync("security", [
       "find-generic-password", "-s", "Claude Code-credentials", "-w"
