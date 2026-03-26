@@ -176,6 +176,8 @@ Add to `~/.openclaw/openclaw.json`:
 
 Restart the gateway: `openclaw gateway restart`
 
+> ⚠️ **Known Issue:** `/ocp` may intermittently return "Unknown skill: ocp" due to an OpenClaw gateway bug with slash sessions ([#26895](https://github.com/openclaw/openclaw/issues/26895)). See [Known Issues](#known-issues) for the workaround.
+
 ### Upgrading from v2.x (skill-based /ocp)
 
 If you previously used the skill-based `/ocp` command (via `skills/ocp/SKILL.md`), remove it to avoid conflicts:
