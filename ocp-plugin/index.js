@@ -31,19 +31,34 @@ function fmtChars(c) {
 
 async function cmdUsage() {
   const d = await fetchJSON("/usage");
-  const s = d.plan.currentSession;
-  const w = d.plan.weeklyLimits.allModels;
-  const e = d.plan.extraUsage;
+  const plan = d.plan || {};
+  const s = plan.currentSession || {};
+  const w = plan.weeklyLimits?.allModels || {};
+  const e = plan.extraUsage || {};
   const px = d.proxy;
   const models = d.models || {};
 
-  let out = "Plan Usage Limits\n";
-  out += "─────────────────────────────\n";
-  out += `Current session   ${bar(s.utilization)} ${s.percent}\n`;
-  out += `                  Resets in ${s.resetsIn}  (${s.resetsAtHuman})\n\n`;
-  out += `Weekly (all)      ${bar(w.utilization)} ${w.percent}\n`;
-  out += `                  Resets in ${w.resetsIn}  (${w.resetsAtHuman})\n\n`;
-  out += `Extra usage       ${e.status === "allowed" ? "on" : "off"}\n\n`;
+  let out = "";
+
+  // Show subscription info if available
+  if (plan.subscription) {
+    out += `Plan: ${plan.subscription} (${plan.rateLimitTier || "default"})\n`;
+  }
+
+  if (s.utilization !== null && s.utilization !== undefined) {
+    // Full plan usage data available (API key mode)
+    out += "Plan Usage Limits\n";
+    out += "─────────────────────────────\n";
+    out += `Current session   ${bar(s.utilization)} ${s.percent}\n`;
+    out += `                  Resets in ${s.resetsIn}  (${s.resetsAtHuman})\n\n`;
+    out += `Weekly (all)      ${bar(w.utilization)} ${w.percent}\n`;
+    out += `                  Resets in ${w.resetsIn}  (${w.resetsAtHuman})\n\n`;
+    out += `Extra usage       ${e.status === "allowed" ? "on" : "off"}\n\n`;
+  } else {
+    // No API key — show note
+    out += "Session/weekly %: claude.ai/settings\n";
+    out += "(Anthropic OAuth API doesn't expose limits yet)\n\n";
+  }
 
   const modelNames = Object.keys(models).sort();
   if (modelNames.length > 0) {
@@ -151,6 +166,84 @@ async function cmdClear() {
   return `Cleared ${d.cleared} sessions.`;
 }
 
+async function cmdVersion() {
+  const d = await fetchJSON("/health");
+  return `OCP v${d.version || "?"}\nUptime: ${d.uptimeHuman || "?"}\nNode: ${process.version}\nPlatform: ${process.platform} ${process.arch}`;
+}
+
+async function cmdTest() {
+  const t0 = Date.now();
+  try {
+    const resp = await fetch(`${PROXY}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        messages: [{ role: "user", content: "say ok" }],
+        max_tokens: 5,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const d = await resp.json();
+    const elapsed = Date.now() - t0;
+    if (d.choices?.[0]?.message?.content) {
+      return `✓ Proxy OK (${elapsed}ms)\n  Model: haiku\n  Response: "${d.choices[0].message.content.slice(0, 50)}"`;
+    }
+    return `✗ Unexpected response: ${JSON.stringify(d).slice(0, 100)}`;
+  } catch (e) {
+    return `✗ Test failed (${Date.now() - t0}ms): ${e.message}`;
+  }
+}
+
+async function cmdBackends() {
+  try {
+    const d = await fetchJSON("/backends");
+    if (!d.backends?.length) return "No backends registered.";
+    let out = "Backends\n─────────────────────────────\n";
+    for (const b of d.backends) {
+      const icon = b.health?.ok ? "🟢" : "🔴";
+      out += `${icon} ${b.displayName} (${b.id}) [${b.tier}]\n`;
+      out += `  Models: ${b.models?.join(", ") || "none"}\n`;
+      out += `  Health: ${b.health?.message || "unknown"} (${b.health?.latencyMs || "?"}ms)\n\n`;
+    }
+    return out.trimEnd();
+  } catch {
+    return "Backends endpoint not available (requires v4+).";
+  }
+}
+
+async function cmdRestart(args) {
+  const target = (args || "").trim().toLowerCase();
+  const { execSync } = await import("node:child_process");
+  try {
+    if (target === "gateway") {
+      execSync("launchctl kickstart -k gui/501/ai.openclaw.gateway", { timeout: 15000 });
+      return "✓ Gateway restarted";
+    } else if (target === "all") {
+      execSync("launchctl kickstart -k gui/501/ai.openclaw.proxy", { timeout: 15000 });
+      // Gateway restart will kill this plugin too, so do it last
+      execSync("launchctl kickstart -k gui/501/ai.openclaw.gateway", { timeout: 15000 });
+      return "✓ Proxy + Gateway restarted";
+    } else {
+      execSync("launchctl kickstart -k gui/501/ai.openclaw.proxy", { timeout: 15000 });
+      return "✓ Proxy restarted";
+    }
+  } catch (e) {
+    // Try systemd for Linux
+    try {
+      if (target === "gateway") {
+        execSync("systemctl --user restart openclaw-gateway", { timeout: 15000 });
+        return "✓ Gateway restarted";
+      } else {
+        execSync("systemctl --user restart openclaw-proxy 2>/dev/null || pkill -f 'node.*server.mjs' && sleep 2 && cd ~/.openclaw/projects/*/; node server.mjs &", { timeout: 15000, shell: true });
+        return "✓ Proxy restarted";
+      }
+    } catch (e2) {
+      return `✗ Restart failed: ${e2.message?.slice(0, 100)}`;
+    }
+  }
+}
+
 async function cmdLogs(args) {
   const parts = (args || "").trim().split(/\s+/);
   const n = parseInt(parts[0]) || 20;
@@ -174,7 +267,13 @@ function cmdHelp() {
 /ocp logs [N] [level]   Recent logs (default: 20, error)
 /ocp models             Available models
 /ocp sessions           Active sessions
-/ocp clear              Clear all sessions`;
+/ocp clear              Clear all sessions
+/ocp restart            Restart proxy
+/ocp restart gateway    Restart gateway
+/ocp restart all        Restart both
+/ocp version            Version & platform info
+/ocp test               End-to-end proxy test
+/ocp backends           Registered backends`;
 }
 
 // ── Plugin entry point ──────────────────────────────────────────────────
@@ -202,6 +301,10 @@ export default function (api) {
           case "models":   text = await cmdModels(); break;
           case "sessions": text = await cmdSessions(); break;
           case "clear":    text = await cmdClear(); break;
+          case "restart":  text = await cmdRestart(subargs); break;
+          case "version":  text = await cmdVersion(); break;
+          case "test":     text = await cmdTest(); break;
+          case "backends": text = await cmdBackends(); break;
           case "logs":     text = await cmdLogs(subargs); break;
           case "help": case "--help": case "-h": case "":
             text = cmdHelp(); break;
